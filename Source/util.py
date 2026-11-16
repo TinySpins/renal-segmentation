@@ -935,10 +935,23 @@ def dicom2hdf5(dicom_path, output_path=None):
             print('\t' + str(i) + '/' + str(len(dicom_list)))
             sys.stdout.flush()
         ds = dicom.read_file(dicom_list[i])
-        slice_location = ds.SliceLocation
-        trigger_time = int(ds.TriggerTime) # ms
+        slice_location = float(ds.SliceLocation)
+
+        # ---------- handle missing TriggerTime (DISCO-Star / STAR_GEMS) ----------
+        if hasattr(ds, 'TriggerTime') and ds.TriggerTime is not None:
+            trigger_time = int(float(ds.TriggerTime))
+        elif hasattr(ds, 'TemporalPositionIdentifier') and ds.TemporalPositionIdentifier is not None:
+            trigger_time = int(ds.TemporalPositionIdentifier)
+        else:
+            # Use AcquisitionTime (HHMMSS) → milliseconds from midnight
+            tstr = str(getattr(ds, 'AcquisitionTime', getattr(ds, 'ContentTime', '000000')))
+            tstr = tstr.split('.')[0].ljust(6, '0')          # ensure HHMMSS
+            h, m, s = int(tstr[0:2]), int(tstr[2:4]), int(tstr[4:6])
+            trigger_time = (h * 3600 + m * 60 + s) * 1000
+        # -------------------------------------------------------------------------
+
         slice_location_set.add(slice_location)
-        trigger_time_set.add(trigger_time) # ms
+        trigger_time_set.add(trigger_time)
         img_list.append((ds.pixel_array, slice_location, trigger_time, dicom_list[i]))
     print('\tDone')
     sys.stdout.flush()

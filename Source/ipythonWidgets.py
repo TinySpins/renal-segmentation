@@ -6,6 +6,7 @@ import warnings
 from skimage.morphology import binary_erosion, disk
 
 def overlayShow(recon, overlay3d, zz=0, tt=0, th=0, oa=1, oe=True, im_range=None, o_range=None, out=None):
+	import matplotlib.patches as mpatches          # ← add this import
 	plt.figure(figsize=(12,9))
 	if im_range is None:
 		im_min = np.amin(recon)
@@ -31,17 +32,25 @@ def overlayShow(recon, overlay3d, zz=0, tt=0, th=0, oa=1, oe=True, im_range=None
 				o_min = o_range[0]
 				o_max = o_range[1]
 			plt.imshow(overlay_mask, interpolation='none', cmap=plt.cm.jet, vmin=o_min, vmax=o_max, alpha=oa)
+
+			# ========== ADD THE LEGEND HERE ==========
+			label_names = {
+				1: 'Aorta',
+				2: 'L Cortex',
+				3: 'R Cortex',
+				4: 'L Medulla',
+				5: 'R Medulla',
+				6: 'L Collecting System',
+				7: 'R Collecting System'
+			}
+			cmap = plt.cm.jet
+			norm = plt.Normalize(vmin=o_min, vmax=o_max)
+			patches = [mpatches.Patch(color=cmap(norm(v)), label='{}: {}'.format(v, n))
+			           for v, n in label_names.items()]
+			plt.legend(handles=patches, loc='upper right', framealpha=0.85)
+			# =========================================
+
 			# overlay_border = overlay_im > th
-			# overlay_border[binary_erosion(overlay_border, disk(1))] = 0
-			# overlay_border_mask = np.ma.masked_where(overlay_border <= 0, overlay_border)
-			# plt.imshow(overlay_border_mask, interpolation='none', cmap=plt.cm.terrain, vmin=o_min, vmax=o_max)
-	# Display the plot in the output widget (if given)
-	if out != None:
-		ax=plt.gca()
-		with out:
-			clear_output(wait=True)
-			display(ax.figure)
-		plt.close()
 
 def overlayViewer(im4d, overlay3d, zz=0, tt=0, th=0, oa=1, im_range=None, o_range=None):
 	tt_enable = True
