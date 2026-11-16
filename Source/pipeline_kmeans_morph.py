@@ -122,43 +122,59 @@ def _read_dicom_force(path):
 
 
 def build_affine_from_dicom(dicom_list, nz, spacing):
+    """
+    Affine for arrays shaped (rows, cols, slices) as produced by dicom2hdf5.
+
+    DICOM:
+      pixel_array axes: 0 = row index, 1 = column index
+      ImageOrientationPatient:
+        [0:3] = direction of increasing columns (along a row)
+        [3:6] = direction of increasing rows (along a column)
+      PixelSpacing: [row_spacing, col_spacing]
+
+    In-plane columns of the affine are negated to match axial DICOM
+    display in ITK-SNAP (180° correction vs raw IOP mapping).
+    """
     templates = dicom_list[:nz]
     ds0 = _read_dicom_force(templates[0])
 
-    # PixelSpacing: [between rows, between cols]
-    dy = float(ds0.PixelSpacing[0])  # axis 0 (rows)
-    dx = float(ds0.PixelSpacing[1])  # axis 1 (cols)
+    dy = float(ds0.PixelSpacing[0])  # spacing between rows  (axis 0)
+    dx = float(ds0.PixelSpacing[1])  # spacing between cols  (axis 1)
     dz = float(spacing[2]) if spacing[2] else float(getattr(ds0, 'SliceThickness', 1.0) or 1.0)
 
-    F = np.diag([dy, dx, abs(dz)]).astype(np.float64)
+    F = np.diag([dy, dx, abs(float(dz))]).astype(np.float64)
     origin = np.zeros(3, dtype=np.float64)
 
     try:
         iop = [float(x) for x in ds0.ImageOrientationPatient]
-        # d_row: increasing columns (IOP 1-3)
-        # d_col: increasing rows    (IOP 4-6)
-        d_row = np.array(iop[0:3], dtype=np.float64)
-        d_col = np.array(iop[3:6], dtype=np.float64)
+        d_row = np.array(iop[0:3], dtype=np.float64)  # +column direction
+        d_col = np.array(iop[3:6], dtype=np.float64)  # +row direction
         d_sl = np.cross(d_row, d_col)
         n = np.linalg.norm(d_sl)
-        if n > 0:
+        if n > 1e-8:
             d_sl = d_sl / n
 
-        ipp0 = np.array([float(x) for x in ds0.ImagePositionPatient], dtype=np.float64)
-        origin = ipp0.copy()
+        origin = np.array(
+            [float(x) for x in ds0.ImagePositionPatient], dtype=np.float64)
 
         if nz >= 2:
             dsN = _read_dicom_force(templates[nz - 1])
-            ippN = np.array([float(x) for x in dsN.ImagePositionPatient], dtype=np.float64)
-            delta = ippN - ipp0
-            dz_signed = np.dot(delta, d_sl) / float(nz - 1)
+            ippN = np.array(
+                [float(x) for x in dsN.ImagePositionPatient], dtype=np.float64)
+            delta = ippN - origin
+            dz_signed = float(np.dot(delta, d_sl) / float(nz - 1))
             if abs(dz_signed) > 1e-6:
                 dz = dz_signed
 
-        # array axes: 0=rows, 1=cols, 2=slice  (no rot90 on data)
-        F[:, 0] = d_col * dy   # along increasing row index
-        F[:, 1] = d_row * dx   # along increasing col index
-        F[:, 2] = d_sl * dz
+        # index (i, j, k) = (row, col, slice)
+        F[:, 0] = d_col * dy
+        F[:, 1] = d_row * dx
+        F[:, 2] = d_sl * float(dz)
+
+        # 180° in-plane vs original DICOM axial view
+        F[:, 0] *= -1.0
+        F[:, 1] *= -1.0
+
     except Exception as e:
         print('Warning: incomplete DICOM orientation (%s); diagonal spacing' % e)
 
