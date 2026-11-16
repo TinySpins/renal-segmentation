@@ -122,31 +122,27 @@ def _read_dicom_force(path):
 
 
 def build_affine_from_dicom(dicom_list, nz, spacing):
-    """
-    Affine for arrays shaped (rows, cols, slices) as in dicom2hdf5.
-    Uses ImageOrientationPatient / ImagePositionPatient when present.
-    """
     templates = dicom_list[:nz]
     ds0 = _read_dicom_force(templates[0])
 
-    dx = float(ds0.PixelSpacing[1])  # column spacing (axis 1 in array is cols)
-    dy = float(ds0.PixelSpacing[0])  # row spacing    (axis 0 in array is rows)
-    # Prefer SpacingBetweenSlices / slice positions for dz
+    # PixelSpacing: [between rows, between cols]
+    dy = float(ds0.PixelSpacing[0])  # axis 0 (rows)
+    dx = float(ds0.PixelSpacing[1])  # axis 1 (cols)
     dz = float(spacing[2]) if spacing[2] else float(getattr(ds0, 'SliceThickness', 1.0) or 1.0)
 
-    # Default LPS-like if orientation missing
-    F = np.eye(3, dtype=np.float64)
+    F = np.diag([dy, dx, abs(dz)]).astype(np.float64)
     origin = np.zeros(3, dtype=np.float64)
 
     try:
-        iop = [float(x) for x in ds0.ImageOrientationPatient]  # 6 values
-        # row direction (along array axis 0), col direction (along array axis 1)
-        row_dir = np.array(iop[0:3], dtype=np.float64)
-        col_dir = np.array(iop[3:6], dtype=np.float64)
-        slice_dir = np.cross(row_dir, col_dir)
-        n = np.linalg.norm(slice_dir)
+        iop = [float(x) for x in ds0.ImageOrientationPatient]
+        # d_row: increasing columns (IOP 1-3)
+        # d_col: increasing rows    (IOP 4-6)
+        d_row = np.array(iop[0:3], dtype=np.float64)
+        d_col = np.array(iop[3:6], dtype=np.float64)
+        d_sl = np.cross(d_row, d_col)
+        n = np.linalg.norm(d_sl)
         if n > 0:
-            slice_dir = slice_dir / n
+            d_sl = d_sl / n
 
         ipp0 = np.array([float(x) for x in ds0.ImagePositionPatient], dtype=np.float64)
         origin = ipp0.copy()
@@ -154,22 +150,17 @@ def build_affine_from_dicom(dicom_list, nz, spacing):
         if nz >= 2:
             dsN = _read_dicom_force(templates[nz - 1])
             ippN = np.array([float(x) for x in dsN.ImagePositionPatient], dtype=np.float64)
-            # signed spacing along slice direction
             delta = ippN - ipp0
-            dz_signed = np.dot(delta, slice_dir) / float(nz - 1)
+            dz_signed = np.dot(delta, d_sl) / float(nz - 1)
             if abs(dz_signed) > 1e-6:
                 dz = dz_signed
-            else:
-                dz = abs(dz) * (1.0 if np.dot(delta, slice_dir) >= 0 else -1.0)
 
-        # voxel (r, c, z) -> world:
-        #   world = origin + r*(dy*row_dir) + c*(dx*col_dir) + z*(dz*slice_dir)
-        F[:, 0] = row_dir * dy
-        F[:, 1] = col_dir * dx
-        F[:, 2] = slice_dir * dz
+        # array axes: 0=rows, 1=cols, 2=slice  (no rot90 on data)
+        F[:, 0] = d_col * dy   # along increasing row index
+        F[:, 1] = d_row * dx   # along increasing col index
+        F[:, 2] = d_sl * dz
     except Exception as e:
-        print('Warning: incomplete DICOM orientation (%s); using diagonal spacing' % e)
-        F = np.diag([dy, dx, abs(dz)]).astype(np.float64)
+        print('Warning: incomplete DICOM orientation (%s); diagonal spacing' % e)
 
     affine = np.eye(4, dtype=np.float64)
     affine[:3, :3] = F
