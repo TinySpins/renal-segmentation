@@ -538,11 +538,14 @@ def run_kmeans_morph_pipeline(
           int(((final_labels == 6) | (final_labels == 7)).sum()))
 
     if output_dir is not None:
-        # refresh dicom_list length vs nt after drops: use first nz of current list
         export_labels_dicom(final_labels, dicom_list, output_dir)
-        # also save numpy
         np.save(os.path.join(output_dir, 'final_labels.npy'), final_labels)
         np.save(os.path.join(output_dir, 'recon_shape.npy'), np.array(recon.shape))
-        print('Saved npy + DICOM labels to', output_dir)
+
+        export_nifti_image_and_labels(
+            recon, final_labels, dicom_list, spacing, output_dir,
+            time_index=None, temp_res=temp_res,
+        )
+        print('Saved DICOM labels + NIfTI image/labels to', output_dir)
 
     return recon, final_labels
