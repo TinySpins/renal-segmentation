@@ -114,6 +114,177 @@ def export_labels_dicom(final_labels, dicom_list, output_dir, series_description
     print('Wrote %d label DICOMs to %s' % (nz, output_dir))
 
 
+def _read_dicom_force(path):
+    try:
+        return dicom.read_file(path)
+    except Exception:
+        return dicom.read_file(path, force=True)
+
+
+def build_affine_from_dicom(dicom_list, nz, spacing):
+    """
+    Affine for arrays shaped (rows, cols, slices) as in dicom2hdf5.
+    Uses ImageOrientationPatient / ImagePositionPatient when present.
+    """
+    templates = dicom_list[:nz]
+    ds0 = _read_dicom_force(templates[0])
+
+    dx = float(ds0.PixelSpacing[1])  # column spacing (axis 1 in array is cols)
+    dy = float(ds0.PixelSpacing[0])  # row spacing    (axis 0 in array is rows)
+    # Prefer SpacingBetweenSlices / slice positions for dz
+    dz = float(spacing[2]) if spacing[2] else float(getattr(ds0, 'SliceThickness', 1.0) or 1.0)
+
+    # Default LPS-like if orientation missing
+    F = np.eye(3, dtype=np.float64)
+    origin = np.zeros(3, dtype=np.float64)
+
+    try:
+        iop = [float(x) for x in ds0.ImageOrientationPatient]  # 6 values
+        # row direction (along array axis 0), col direction (along array axis 1)
+        row_dir = np.array(iop[0:3], dtype=np.float64)
+        col_dir = np.array(iop[3:6], dtype=np.float64)
+        slice_dir = np.cross(row_dir, col_dir)
+        n = np.linalg.norm(slice_dir)
+        if n > 0:
+            slice_dir = slice_dir / n
+
+        ipp0 = np.array([float(x) for x in ds0.ImagePositionPatient], dtype=np.float64)
+        origin = ipp0.copy()
+
+        if nz >= 2:
+            dsN = _read_dicom_force(templates[nz - 1])
+            ippN = np.array([float(x) for x in dsN.ImagePositionPatient], dtype=np.float64)
+            # signed spacing along slice direction
+            delta = ippN - ipp0
+            dz_signed = np.dot(delta, slice_dir) / float(nz - 1)
+            if abs(dz_signed) > 1e-6:
+                dz = dz_signed
+            else:
+                dz = abs(dz) * (1.0 if np.dot(delta, slice_dir) >= 0 else -1.0)
+
+        # voxel (r, c, z) -> world:
+        #   world = origin + r*(dy*row_dir) + c*(dx*col_dir) + z*(dz*slice_dir)
+        F[:, 0] = row_dir * dy
+        F[:, 1] = col_dir * dx
+        F[:, 2] = slice_dir * dz
+    except Exception as e:
+        print('Warning: incomplete DICOM orientation (%s); using diagonal spacing' % e)
+        F = np.diag([dy, dx, abs(dz)]).astype(np.float64)
+
+    affine = np.eye(4, dtype=np.float64)
+    affine[:3, :3] = F
+    affine[:3, 3] = origin
+    return affine
+
+
+def write_nifti(array, affine, out_path):
+    """
+    Minimal NIfTI-1 (.nii) writer. array axes = (rows, cols, slices[, time]).
+    No rot90 — orientation is entirely in the affine from DICOM.
+    """
+    data = np.ascontiguousarray(array)
+    shape = data.shape
+    ndim = data.ndim
+
+    header = bytearray(348)
+    header[0:4] = np.int32(348).tobytes()
+
+    dim = np.zeros(8, dtype=np.int16)
+    dim[0] = ndim
+    for i in range(ndim):
+        dim[i + 1] = shape[i]
+    header[40:56] = dim.tobytes()
+
+    if data.dtype == np.uint8:
+        datatype, bitpix = 2, 8
+    elif data.dtype == np.int16:
+        datatype, bitpix = 4, 16
+    elif data.dtype == np.uint16:
+        datatype, bitpix = 512, 16  # DT_UINT16
+    elif data.dtype == np.float32:
+        datatype, bitpix = 16, 32
+    else:
+        data = data.astype(np.float32)
+        datatype, bitpix = 16, 32
+
+    header[70:72] = np.int16(datatype).tobytes()
+    header[72:74] = np.int16(bitpix).tobytes()
+
+    # pixdim from affine column norms
+    pixdim = np.zeros(8, dtype=np.float32)
+    pixdim[0] = 1.0  # qfac
+    for i in range(min(3, ndim)):
+        pixdim[i + 1] = float(np.linalg.norm(affine[:3, i]))
+    if ndim >= 4:
+        pixdim[4] = 1.0
+    header[76:108] = pixdim.tobytes()
+
+    header[108:112] = np.float32(352.0).tobytes()  # vox_offset
+
+    # sform: affine method 2
+    header[254:256] = np.int16(2).tobytes()  # sform_code = NIFTI_XFORM_SCANNER_ANAT
+    header[280:284] = np.float32(affine[0, 0]).tobytes()
+    header[284:288] = np.float32(affine[0, 1]).tobytes()
+    header[288:292] = np.float32(affine[0, 2]).tobytes()
+    header[292:296] = np.float32(affine[0, 3]).tobytes()
+    header[296:300] = np.float32(affine[1, 0]).tobytes()
+    header[300:304] = np.float32(affine[1, 1]).tobytes()
+    header[304:308] = np.float32(affine[1, 2]).tobytes()
+    header[308:312] = np.float32(affine[1, 3]).tobytes()
+    header[312:316] = np.float32(affine[2, 0]).tobytes()
+    header[316:320] = np.float32(affine[2, 1]).tobytes()
+    header[320:324] = np.float32(affine[2, 2]).tobytes()
+    header[324:328] = np.float32(affine[2, 3]).tobytes()
+
+    header[344:348] = b'n+1\0'
+
+    # NIfTI expects voxel data in Fortran order relative to dim[1],dim[2],...
+    with open(out_path, 'wb') as f:
+        f.write(header)
+        f.write(b'\0' * 4)
+        f.write(np.asfortranarray(data).tobytes(order='F'))
+    print('Wrote', out_path, 'shape', shape)
+
+
+def export_nifti_image_and_labels(recon, final_labels, dicom_list, spacing,
+                                  output_dir, time_index=None, temp_res=None):
+    """
+    Export:
+      image.nii  – one 3D time frame (default ~ mid / ~90s)
+      labels.nii – segmentation, same grid + same affine
+    No rot90; orientation from DICOM IOP/IPP.
+    """
+    try:
+        os.makedirs(output_dir)
+    except OSError:
+        pass
+
+    nx, ny, nz, nt = recon.shape
+    assert final_labels.shape == (nx, ny, nz)
+
+    if time_index is None:
+        if temp_res is not None and temp_res > 0:
+            time_index = int(min(max(round(90.0 / float(temp_res)), 0), nt - 1))
+        else:
+            time_index = min(nt // 2, nt - 1)
+
+    affine = build_affine_from_dicom(dicom_list, nz, spacing)
+
+    # Image: scale to uint16 for viewing
+    vol = recon[:, :, :, time_index].astype(np.float64)
+    vol = vol - vol.min()
+    if vol.max() > 0:
+        vol = vol / vol.max() * 4095.0
+    img_u16 = np.round(vol).astype(np.uint16)
+
+    labels_u8 = final_labels.astype(np.uint8)
+
+    write_nifti(img_u16, affine, os.path.join(output_dir, 'image.nii'))
+    write_nifti(labels_u8, affine, os.path.join(output_dir, 'labels.nii'))
+    print('NIfTI export: time_index=%d / %d, affine origin=%s' % (
+        time_index, nt, np.round(affine[:3, 3], 2)))
+
+
 def run_kmeans_morph_pipeline(
         input_dir,
         output_dir=None,
