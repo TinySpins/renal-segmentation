@@ -1,6 +1,11 @@
 # Source/pipeline_kmeans_morph.py
 """
 K-means + morphology renal tissue segmentation (cortex / medulla / pelvis).
+
+Outputs under output_dir:
+  python/   final_labels.npy, whole_kidney.npy, recon_shape.npy
+  nifti/    image.nii, labels.nii, whole_kidney.nii
+  dicom/    images/, whole_kidney/, labels/
 """
 from __future__ import print_function
 
@@ -12,7 +17,6 @@ from skimage.morphology import convex_hull_image
 from scipy.ndimage import (
     binary_fill_holes,
     binary_erosion,
-    binary_dilation,
     distance_transform_edt,
     label as cc_label,
     uniform_filter,
@@ -23,7 +27,26 @@ from Source.segmentation import renal_segment_v4
 from Source.dicom_load_tolerant import load_dicom_dataset
 
 
+# =============================================================================
+# DICOM / NIfTI I/O helpers
+# =============================================================================
+
+def _ensure_dir(path):
+    try:
+        os.makedirs(path)
+    except OSError:
+        pass
+
+
+def _read_dicom_force(path):
+    try:
+        return dicom.read_file(path)
+    except Exception:
+        return dicom.read_file(path, force=True)
+
+
 def drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=2.5):
+    """Remove trailing time phases whose trigger gap >> median gap."""
     nx, ny, nz, nt = recon.shape
     n_files = len(dicom_list)
     triggers = []
@@ -31,7 +54,7 @@ def drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=2.5):
         idx = t * nz
         if idx >= n_files:
             break
-        ds = dicom.read_file(dicom_list[idx])
+        ds = _read_dicom_force(dicom_list[idx])
         if hasattr(ds, 'TriggerTime') and ds.TriggerTime is not None:
             tr = float(ds.TriggerTime)
         elif hasattr(ds, 'AcquisitionTime') and ds.AcquisitionTime is not None:
@@ -78,68 +101,19 @@ def drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=2.5):
     return recon
 
 
-def export_labels_dicom(final_labels, dicom_list, output_dir, series_description='KMeans_Morph_Segmentation'):
-    try:
-        os.makedirs(output_dir)
-    except OSError:
-        pass
-
-    nz = final_labels.shape[2]
-    templates = dicom_list[:nz]
-    if len(templates) < nz:
-        raise ValueError('dicom_list has fewer than nz templates')
-
-    series_uid = dicom.UID.generate_uid()
-    for zz in range(nz):
-        img = final_labels[:, :, zz]
-        pixel_array = img.astype(np.uint16) * 50 + 250
-        pixel_array[img == 0] = 0
-
-        ds = dicom.read_file(templates[zz])
-        ds.SeriesInstanceUID = series_uid
-        ds.SeriesDescription = series_description
-        ds.InstanceNumber = zz + 1
-        ds.SOPInstanceUID = dicom.UID.generate_uid()
-        ds.HighBit = 15
-        ds.BitsStored = 16
-        ds.BitsAllocated = 16
-        ds.SamplesPerPixel = 1
-        ds.PhotometricInterpretation = 'MONOCHROME2'
-        ds.PixelData = pixel_array.astype(np.uint16).tostring()
-        ds.SmallestImagePixelValue = 0
-        ds.LargestImagePixelValue = int(pixel_array.max())
-        ds[0x0028, 0x0106].VR = 'US'
-        ds[0x0028, 0x0107].VR = 'US'
-        ds.save_as(os.path.join(output_dir, '%04d.dcm' % zz))
-    print('Wrote %d label DICOMs to %s' % (nz, output_dir))
-
-
-def _read_dicom_force(path):
-    try:
-        return dicom.read_file(path)
-    except Exception:
-        return dicom.read_file(path, force=True)
-
-
 def build_affine_from_dicom(dicom_list, nz, spacing):
     """
-    Affine for arrays shaped (rows, cols, slices) as produced by dicom2hdf5.
+    Affine for arrays (rows, cols, slices) from dicom2hdf5.
 
-    DICOM:
-      pixel_array axes: 0 = row index, 1 = column index
-      ImageOrientationPatient:
-        [0:3] = direction of increasing columns (along a row)
-        [3:6] = direction of increasing rows (along a column)
-      PixelSpacing: [row_spacing, col_spacing]
-
-    In-plane columns of the affine are negated to match axial DICOM
-    display in ITK-SNAP (180° correction vs raw IOP mapping).
+    IOP: [0:3] +column dir, [3:6] +row dir.
+    PixelSpacing: [row_spacing, col_spacing].
+    In-plane axes negated for 180° match to DICOM axial view in ITK-SNAP.
     """
     templates = dicom_list[:nz]
     ds0 = _read_dicom_force(templates[0])
 
-    dy = float(ds0.PixelSpacing[0])  # spacing between rows  (axis 0)
-    dx = float(ds0.PixelSpacing[1])  # spacing between cols  (axis 1)
+    dy = float(ds0.PixelSpacing[0])
+    dx = float(ds0.PixelSpacing[1])
     dz = float(spacing[2]) if spacing[2] else float(getattr(ds0, 'SliceThickness', 1.0) or 1.0)
 
     F = np.diag([dy, dx, abs(float(dz))]).astype(np.float64)
@@ -147,8 +121,8 @@ def build_affine_from_dicom(dicom_list, nz, spacing):
 
     try:
         iop = [float(x) for x in ds0.ImageOrientationPatient]
-        d_row = np.array(iop[0:3], dtype=np.float64)  # +column direction
-        d_col = np.array(iop[3:6], dtype=np.float64)  # +row direction
+        d_row = np.array(iop[0:3], dtype=np.float64)
+        d_col = np.array(iop[3:6], dtype=np.float64)
         d_sl = np.cross(d_row, d_col)
         n = np.linalg.norm(d_sl)
         if n > 1e-8:
@@ -166,15 +140,11 @@ def build_affine_from_dicom(dicom_list, nz, spacing):
             if abs(dz_signed) > 1e-6:
                 dz = dz_signed
 
-        # index (i, j, k) = (row, col, slice)
         F[:, 0] = d_col * dy
         F[:, 1] = d_row * dx
         F[:, 2] = d_sl * float(dz)
-
-        # 180° in-plane vs original DICOM axial view
         F[:, 0] *= -1.0
         F[:, 1] *= -1.0
-
     except Exception as e:
         print('Warning: incomplete DICOM orientation (%s); diagonal spacing' % e)
 
@@ -185,10 +155,7 @@ def build_affine_from_dicom(dicom_list, nz, spacing):
 
 
 def write_nifti(array, affine, out_path):
-    """
-    Minimal NIfTI-1 (.nii) writer. array axes = (rows, cols, slices[, time]).
-    No rot90 — orientation is entirely in the affine from DICOM.
-    """
+    """Minimal NIfTI-1 writer. Axes (rows, cols, slices[, time]); no rot90."""
     data = np.ascontiguousarray(array)
     shape = data.shape
     ndim = data.ndim
@@ -207,7 +174,7 @@ def write_nifti(array, affine, out_path):
     elif data.dtype == np.int16:
         datatype, bitpix = 4, 16
     elif data.dtype == np.uint16:
-        datatype, bitpix = 512, 16  # DT_UINT16
+        datatype, bitpix = 512, 16
     elif data.dtype == np.float32:
         datatype, bitpix = 16, 32
     else:
@@ -217,35 +184,23 @@ def write_nifti(array, affine, out_path):
     header[70:72] = np.int16(datatype).tobytes()
     header[72:74] = np.int16(bitpix).tobytes()
 
-    # pixdim from affine column norms
     pixdim = np.zeros(8, dtype=np.float32)
-    pixdim[0] = 1.0  # qfac
+    pixdim[0] = 1.0
     for i in range(min(3, ndim)):
         pixdim[i + 1] = float(np.linalg.norm(affine[:3, i]))
     if ndim >= 4:
         pixdim[4] = 1.0
     header[76:108] = pixdim.tobytes()
+    header[108:112] = np.float32(352.0).tobytes()
 
-    header[108:112] = np.float32(352.0).tobytes()  # vox_offset
-
-    # sform: affine method 2
-    header[254:256] = np.int16(2).tobytes()  # sform_code = NIFTI_XFORM_SCANNER_ANAT
-    header[280:284] = np.float32(affine[0, 0]).tobytes()
-    header[284:288] = np.float32(affine[0, 1]).tobytes()
-    header[288:292] = np.float32(affine[0, 2]).tobytes()
-    header[292:296] = np.float32(affine[0, 3]).tobytes()
-    header[296:300] = np.float32(affine[1, 0]).tobytes()
-    header[300:304] = np.float32(affine[1, 1]).tobytes()
-    header[304:308] = np.float32(affine[1, 2]).tobytes()
-    header[308:312] = np.float32(affine[1, 3]).tobytes()
-    header[312:316] = np.float32(affine[2, 0]).tobytes()
-    header[316:320] = np.float32(affine[2, 1]).tobytes()
-    header[320:324] = np.float32(affine[2, 2]).tobytes()
-    header[324:328] = np.float32(affine[2, 3]).tobytes()
+    header[254:256] = np.int16(2).tobytes()
+    for r in range(3):
+        for c in range(4):
+            off = 280 + (r * 4 + c) * 4
+            header[off:off + 4] = np.float32(affine[r, c]).tobytes()
 
     header[344:348] = b'n+1\0'
 
-    # NIfTI expects voxel data in Fortran order relative to dim[1],dim[2],...
     with open(out_path, 'wb') as f:
         f.write(header)
         f.write(b'\0' * 4)
@@ -253,21 +208,78 @@ def write_nifti(array, affine, out_path):
     print('Wrote', out_path, 'shape', shape)
 
 
-def export_nifti_image_and_labels(recon, final_labels, dicom_list, spacing,
-                                  output_dir, time_index=None, temp_res=None):
+def export_volume_dicom(vol3d, dicom_list, output_dir, series_description,
+                        scale_mode='labels'):
     """
-    Export:
-      image.nii  – one 3D time frame (default ~ mid / ~90s)
-      labels.nii – segmentation, same grid + same affine
-    No rot90; orientation from DICOM IOP/IPP.
+    scale_mode:
+      'labels' – tissue labels *50+250
+      'mask'   – binary mask 0/1000
+      'image'  – scaled MR to uint16
     """
-    try:
-        os.makedirs(output_dir)
-    except OSError:
-        pass
+    _ensure_dir(output_dir)
+    nz = vol3d.shape[2]
+    templates = dicom_list[:nz]
+    if len(templates) < nz:
+        raise ValueError('dicom_list shorter than nz')
 
+    series_uid = dicom.UID.generate_uid()
+    for zz in range(nz):
+        sl = vol3d[:, :, zz]
+        if scale_mode == 'labels':
+            pix = sl.astype(np.uint16) * 50 + 250
+            pix[sl == 0] = 0
+        elif scale_mode == 'mask':
+            pix = (sl > 0).astype(np.uint16) * 1000
+        else:
+            v = sl.astype(np.float64)
+            v = v - v.min()
+            if v.max() > 0:
+                v = v / v.max() * 4095.0
+            pix = np.round(v).astype(np.uint16)
+
+        ds = _read_dicom_force(templates[zz])
+        ds.SeriesInstanceUID = series_uid
+        ds.SeriesDescription = series_description
+        ds.InstanceNumber = zz + 1
+        ds.SOPInstanceUID = dicom.UID.generate_uid()
+        ds.HighBit = 15
+        ds.BitsStored = 16
+        ds.BitsAllocated = 16
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+        ds.PixelData = pix.astype(np.uint16).tostring()
+        ds.SmallestImagePixelValue = 0
+        ds.LargestImagePixelValue = int(pix.max()) if pix.size else 0
+        ds[0x0028, 0x0106].VR = 'US'
+        ds[0x0028, 0x0107].VR = 'US'
+        ds.save_as(os.path.join(output_dir, '%04d.dcm' % zz))
+    print('DICOM series ->', output_dir, '(%d slices)' % nz)
+
+
+def export_all_outputs(recon, final_labels, whole_kidney, dicom_list, spacing,
+                       output_dir, temp_res=None, time_index=None):
+    """
+    output_dir/
+      python/  *.npy
+      nifti/   image.nii, labels.nii, whole_kidney.nii
+      dicom/   images/, whole_kidney/, labels/
+    """
     nx, ny, nz, nt = recon.shape
-    assert final_labels.shape == (nx, ny, nz)
+    whole_kidney = (whole_kidney > 0).astype(np.uint8)
+    final_labels = final_labels.astype(np.uint8)
+
+    py_dir = os.path.join(output_dir, 'python')
+    nii_dir = os.path.join(output_dir, 'nifti')
+    dcm_img = os.path.join(output_dir, 'dicom', 'images')
+    dcm_kid = os.path.join(output_dir, 'dicom', 'whole_kidney')
+    dcm_lab = os.path.join(output_dir, 'dicom', 'labels')
+    for d in (py_dir, nii_dir, dcm_img, dcm_kid, dcm_lab):
+        _ensure_dir(d)
+
+    np.save(os.path.join(py_dir, 'final_labels.npy'), final_labels)
+    np.save(os.path.join(py_dir, 'whole_kidney.npy'), whole_kidney)
+    np.save(os.path.join(py_dir, 'recon_shape.npy'), np.array(recon.shape))
+    print('NumPy ->', py_dir)
 
     if time_index is None:
         if temp_res is not None and temp_res > 0:
@@ -277,20 +289,29 @@ def export_nifti_image_and_labels(recon, final_labels, dicom_list, spacing,
 
     affine = build_affine_from_dicom(dicom_list, nz, spacing)
 
-    # Image: scale to uint16 for viewing
     vol = recon[:, :, :, time_index].astype(np.float64)
     vol = vol - vol.min()
     if vol.max() > 0:
         vol = vol / vol.max() * 4095.0
     img_u16 = np.round(vol).astype(np.uint16)
 
-    labels_u8 = final_labels.astype(np.uint8)
+    write_nifti(img_u16, affine, os.path.join(nii_dir, 'image.nii'))
+    write_nifti(final_labels, affine, os.path.join(nii_dir, 'labels.nii'))
+    write_nifti(whole_kidney, affine, os.path.join(nii_dir, 'whole_kidney.nii'))
+    print('NIfTI ->', nii_dir, '(t=%d)' % time_index)
 
-    write_nifti(img_u16, affine, os.path.join(output_dir, 'image.nii'))
-    write_nifti(labels_u8, affine, os.path.join(output_dir, 'labels.nii'))
-    print('NIfTI export: time_index=%d / %d, affine origin=%s' % (
-        time_index, nt, np.round(affine[:3, 3], 2)))
+    export_volume_dicom(img_u16, dicom_list, dcm_img,
+                        series_description='MR_image', scale_mode='image')
+    export_volume_dicom(whole_kidney, dicom_list, dcm_kid,
+                        series_description='Whole_Kidney', scale_mode='mask')
+    export_volume_dicom(final_labels, dicom_list, dcm_lab,
+                        series_description='Tissue_Labels', scale_mode='labels')
+    print('DICOM ->', os.path.join(output_dir, 'dicom'))
 
+
+# =============================================================================
+# Main pipeline
+# =============================================================================
 
 def run_kmeans_morph_pipeline(
         input_dir,
@@ -306,8 +327,8 @@ def run_kmeans_morph_pipeline(
     """
     Returns
     -------
-    recon : ndarray (nx, ny, nz, nt)
-    final_labels : ndarray (nx, ny, nz) uint8
+    recon : (nx, ny, nz, nt)
+    final_labels : (nx, ny, nz) uint8
         0 bg, 2/3 L/R cortex, 4/5 L/R medulla, 6/7 L/R pelvis
     """
     if root_path is None:
@@ -323,7 +344,8 @@ def run_kmeans_morph_pipeline(
     print('Loaded shape:', recon.shape, 'temp_res(s):', temp_res)
 
     # ---- trailing high triggers ----
-    recon = drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=gap_factor)
+    recon = drop_trailing_high_trigger_frames(
+        recon, dicom_list, gap_factor=gap_factor)
 
     # ---- GrabCut ----
     print('Running GrabCut...')
@@ -357,7 +379,8 @@ def run_kmeans_morph_pipeline(
     kidney_filled = np.zeros_like(kidney_raw)
     for z in range(kidney_raw.shape[2]):
         kidney_filled[:, :, z] = binary_fill_holes(kidney_raw[:, :, z])
-    idx = distance_transform_edt(~kidney_raw, return_distances=False, return_indices=True)
+    idx = distance_transform_edt(
+        ~kidney_raw, return_distances=False, return_indices=True)
     gc_filled = gc_labels[idx[0], idx[1], idx[2]]
     gc_filled[~kidney_filled] = 0
     kidney = gc_filled > 0
@@ -383,6 +406,7 @@ def run_kmeans_morph_pipeline(
     cluster_vol[kidney] = cluster_id + 1
 
     # ---- cluster → tissue ----
+    # Cortex = largest; medulla = max post-cortical rise; pelvis = remaining
     time = np.arange(recon.shape[3]) * temp_res
     nt = recon.shape[3]
     sizes, curves, peaks = {}, {}, {}
@@ -509,7 +533,8 @@ def run_kmeans_morph_pipeline(
         final_labels[indent & (gc_temp_id == kid_id)] = 6 if kid_id == 1 else 7
     still = indent & ((final_labels == 0) | (final_labels == 1))
     if still.any():
-        idx = distance_transform_edt(~gc_original, return_distances=False, return_indices=True)
+        idx = distance_transform_edt(
+            ~gc_original, return_distances=False, return_indices=True)
         nearest = gc_filled[idx[0], idx[1], idx[2]]
         for kid_id in kid_ids:
             final_labels[still & (nearest == kid_id)] = 6 if kid_id == 1 else 7
@@ -522,14 +547,16 @@ def run_kmeans_morph_pipeline(
         if m.any():
             labeled, n = cc_label(m)
             if n > 1:
-                sz = np.bincount(labeled.ravel()); sz[0] = 0
+                sz = np.bincount(labeled.ravel())
+                sz[0] = 0
                 keep = labeled == sz.argmax()
                 final_labels[m & ~keep] = med_val
         m = final_labels == pel_val
         if m.any():
             labeled, n = cc_label(m)
             if n > 1:
-                sz = np.bincount(labeled.ravel()); sz[0] = 0
+                sz = np.bincount(labeled.ravel())
+                sz[0] = 0
                 keep = labeled == sz.argmax()
                 final_labels[m & ~keep] = ctx_val
 
@@ -544,15 +571,13 @@ def run_kmeans_morph_pipeline(
           int(((final_labels == 4) | (final_labels == 5)).sum()),
           int(((final_labels == 6) | (final_labels == 7)).sum()))
 
-    if output_dir is not None:
-        export_labels_dicom(final_labels, dicom_list, output_dir)
-        np.save(os.path.join(output_dir, 'final_labels.npy'), final_labels)
-        np.save(os.path.join(output_dir, 'recon_shape.npy'), np.array(recon.shape))
+    whole_kidney = (gc_filled > 0).astype(np.uint8)
 
-        export_nifti_image_and_labels(
-            recon, final_labels, dicom_list, spacing, output_dir,
-            time_index=None, temp_res=temp_res,
+    if output_dir is not None:
+        export_all_outputs(
+            recon, final_labels, whole_kidney,
+            dicom_list, spacing, output_dir,
+            temp_res=temp_res, time_index=None,
         )
-        print('Saved DICOM labels + NIfTI image/labels to', output_dir)
 
     return recon, final_labels
