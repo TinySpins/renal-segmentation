@@ -1,4 +1,23 @@
-# renal-segmentation
+## Modified repo description: renal-segmentation with Kmeans and morphological rules
+
+Download the original docker image: https://hub.docker.com/r/umityoruk/renal-segmentation/
+
+Clone the modified repository.
+
+Run the original docker image with the modified Source:
+
+DATA=/path/to/data
+SRC=/path/to/renal-custom
+
+docker run --rm \
+  -v "$DATA:/data" \
+  -v "$SRC/Source:/renal-segmentation/Source" \
+  -v "$SRC/renalSegment_kmeans_morph.py:/renal-segmentation/renalSegment_kmeans_morph.py" \
+  umityoruk/renal-segmentation \
+  python /renal-segmentation/renalSegment_kmeans_morph.py \
+    /data/DicomIn /data/DicomOut_kmeans_morph
+
+## Original repo description: renal-segmentation
 
 Automatic Renal Segmentation for MR Urography Using 3D-GrabCut and Random Forests
 
