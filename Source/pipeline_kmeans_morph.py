@@ -13,7 +13,7 @@ import os
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from skimage.morphology import convex_hull_image
+from skimage.morphology import convex_hull_image, disk, binary_opening
 from scipy.ndimage import (
     binary_fill_holes,
     binary_erosion,
@@ -46,7 +46,6 @@ def _read_dicom_force(path):
 
 
 def drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=2.5):
-    """Remove trailing time phases whose trigger gap >> median gap."""
     nx, ny, nz, nt = recon.shape
     n_files = len(dicom_list)
     triggers = []
@@ -102,13 +101,6 @@ def drop_trailing_high_trigger_frames(recon, dicom_list, gap_factor=2.5):
 
 
 def build_affine_from_dicom(dicom_list, nz, spacing):
-    """
-    Affine for arrays (rows, cols, slices) from dicom2hdf5.
-
-    IOP: [0:3] +column dir, [3:6] +row dir.
-    PixelSpacing: [row_spacing, col_spacing].
-    In-plane axes negated for 180° match to DICOM axial view in ITK-SNAP.
-    """
     templates = dicom_list[:nz]
     ds0 = _read_dicom_force(templates[0])
 
@@ -155,7 +147,6 @@ def build_affine_from_dicom(dicom_list, nz, spacing):
 
 
 def write_nifti(array, affine, out_path):
-    """Minimal NIfTI-1 writer. Axes (rows, cols, slices[, time]); no rot90."""
     data = np.ascontiguousarray(array)
     shape = data.shape
     ndim = data.ndim
@@ -210,12 +201,6 @@ def write_nifti(array, affine, out_path):
 
 def export_volume_dicom(vol3d, dicom_list, output_dir, series_description,
                         scale_mode='labels'):
-    """
-    scale_mode:
-      'labels' – tissue labels *50+250
-      'mask'   – binary mask 0/1000
-      'image'  – scaled MR to uint16
-    """
     _ensure_dir(output_dir)
     nz = vol3d.shape[2]
     templates = dicom_list[:nz]
@@ -258,12 +243,6 @@ def export_volume_dicom(vol3d, dicom_list, output_dir, series_description,
 
 def export_all_outputs(recon, final_labels, whole_kidney, dicom_list, spacing,
                        output_dir, temp_res=None, time_index=None):
-    """
-    output_dir/
-      python/  *.npy
-      nifti/   image.nii, labels.nii, whole_kidney.nii
-      dicom/   images/, whole_kidney/, labels/
-    """
     nx, ny, nz, nt = recon.shape
     whole_kidney = (whole_kidney > 0).astype(np.uint8)
     final_labels = final_labels.astype(np.uint8)
@@ -310,6 +289,80 @@ def export_all_outputs(recon, final_labels, whole_kidney, dicom_list, spacing,
 
 
 # =============================================================================
+# Hilum / vessel stem cleanup (axial morphological opening)
+# =============================================================================
+
+def kidney_minor_axis_mm(mask3d, spacing):
+    """Median in-plane minor-axis width (mm) over non-empty axial slices."""
+    sx, sy = float(spacing[0]), float(spacing[1])
+    widths = []
+    for z in range(mask3d.shape[2]):
+        sl = mask3d[:, :, z]
+        if sl.sum() < 50:
+            continue
+        ys, xs = np.where(sl)
+        pts = np.column_stack([xs * sx, ys * sy]).astype(np.float64)
+        pts -= pts.mean(axis=0)
+        if pts.shape[0] < 10:
+            continue
+        cov = np.cov(pts, rowvar=False)
+        eig = np.linalg.eigvalsh(cov)
+        eig = np.maximum(eig, 0.0)
+        minor = 2.0 * np.sqrt(eig[0])
+        widths.append(minor)
+    if not widths:
+        return None
+    return float(np.median(widths))
+
+
+def opening_radius_vox(minor_mm, spacing, fraction=0.10, rmin_mm=1.5, rmax_mm=5.0):
+    sx, sy = float(spacing[0]), float(spacing[1])
+    pix = 0.5 * (sx + sy)
+    r_mm = float(np.clip(fraction * minor_mm, rmin_mm, rmax_mm))
+    r_vox = max(1, int(round(r_mm / max(pix, 1e-6))))
+    return r_vox, r_mm
+
+
+def clean_hilum_protrusions_axial(
+        gc_labels, spacing,
+        fraction=0.10, rmin_mm=1.5, rmax_mm=5.0,
+        enabled=True):
+    """
+    Axial (per-slice) morphological opening to remove thin vessel/ureter
+    stems at the hilum. Radius = fraction of kidney minor-axis width (mm),
+    clipped to [rmin_mm, rmax_mm].
+    """
+    if not enabled:
+        print('Hilum axial opening: disabled')
+        return gc_labels
+
+    out = np.zeros_like(gc_labels)
+    for kid_id in [k for k in np.unique(gc_labels) if k > 0]:
+        m = gc_labels == kid_id
+        minor = kidney_minor_axis_mm(m, spacing)
+        if minor is None:
+            r_vox, r_mm = 2, 3.0
+            print('Kidney %d: minor axis unknown → open r=%.1f mm (%d vox)' % (
+                kid_id, r_mm, r_vox))
+        else:
+            r_vox, r_mm = opening_radius_vox(
+                minor, spacing, fraction=fraction,
+                rmin_mm=rmin_mm, rmax_mm=rmax_mm)
+            print('Kidney %d: minor≈%.1f mm → open r=%.1f mm (%d vox)' % (
+                kid_id, minor, r_mm, r_vox))
+
+        selem = disk(r_vox)
+        cleaned = np.zeros_like(m)
+        for z in range(m.shape[2]):
+            sl = m[:, :, z]
+            if not sl.any():
+                continue
+            cleaned[:, :, z] = binary_opening(sl, selem)
+        out[cleaned] = kid_id
+    return out
+
+
+# =============================================================================
 # Main pipeline
 # =============================================================================
 
@@ -323,19 +376,15 @@ def run_kmeans_morph_pipeline(
         moco_ref_time_s=10.0,
         moco_maxiter=40,
         run_second_grabcut=False,
+        hilum_open=True,
+        hilum_open_fraction=0.10,
+        hilum_open_rmin_mm=1.5,
+        hilum_open_rmax_mm=5.0,
 ):
-    """
-    Returns
-    -------
-    recon : (nx, ny, nz, nt)
-    final_labels : (nx, ny, nz) uint8
-        0 bg, 2/3 L/R cortex, 4/5 L/R medulla, 6/7 L/R pelvis
-    """
     if root_path is None:
         source_path = os.path.dirname(os.path.realpath(__file__))
         root_path = os.path.abspath(os.path.join(source_path, '..'))
 
-    # ---- load ----
     dataset = load_dicom_dataset(input_dir, quarantine=True, always_scan=True)
     recon = dataset['recon']
     temp_res = dataset['temp_res'] / 1000.0
@@ -343,11 +392,9 @@ def run_kmeans_morph_pipeline(
     dicom_list = dataset['dicom_list']
     print('Loaded shape:', recon.shape, 'temp_res(s):', temp_res)
 
-    # ---- trailing high triggers ----
     recon = drop_trailing_high_trigger_frames(
         recon, dicom_list, gap_factor=gap_factor)
 
-    # ---- GrabCut ----
     print('Running GrabCut...')
     gc_labels = renal_segment_v4(
         recon, temp_res=temp_res, spacing=spacing,
@@ -355,7 +402,6 @@ def run_kmeans_morph_pipeline(
     )
     print('GrabCut labels:', np.unique(gc_labels))
 
-    # ---- optional MoCo ----
     if run_moco:
         from Source.motion_correction import motion_correct_affine_per_kidney
         print('Running MoCo ref_time_s=%.1f' % moco_ref_time_s)
@@ -372,6 +418,15 @@ def run_kmeans_morph_pipeline(
                 root_path=root_path, threshold_multiplier=threshold_multiplier,
             )
 
+    # ---- axial hilum / vessel stem cleanup ----
+    gc_labels = clean_hilum_protrusions_axial(
+        gc_labels, spacing,
+        fraction=hilum_open_fraction,
+        rmin_mm=hilum_open_rmin_mm,
+        rmax_mm=hilum_open_rmax_mm,
+        enabled=hilum_open,
+    )
+    print('GrabCut labels after hilum cleanup:', np.unique(gc_labels))
     kid_ids = [k for k in np.unique(gc_labels) if k > 0]
 
     # ---- hole-fill ----
@@ -405,8 +460,6 @@ def run_kmeans_morph_pipeline(
     cluster_vol = np.zeros(recon.shape[:3], dtype=np.int8)
     cluster_vol[kidney] = cluster_id + 1
 
-    # ---- cluster → tissue ----
-    # Cortex = largest; medulla = max post-cortical rise; pelvis = remaining
     time = np.arange(recon.shape[3]) * temp_res
     nt = recon.shape[3]
     sizes, curves, peaks = {}, {}, {}
@@ -464,7 +517,6 @@ def run_kmeans_morph_pipeline(
     cluster_vol_refined = cluster_vol.copy()
     cluster_vol_refined[med_dropped] = 0
 
-    # ---- morphology labels ----
     final_labels = np.zeros(recon.shape[:3], dtype=np.uint8)
     voxel_vol_mm3 = float(np.prod(spacing))
 

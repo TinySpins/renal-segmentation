@@ -4,7 +4,8 @@ K-means + morphology renal segmentation CLI.
 
 Usage:
   python renalSegment_kmeans_morph.py /data/DicomIn /data/DicomOut
-  python renalSegment_kmeans_morph.py /data/DicomIn /data/DicomOut --moco
+  python renalSegment_kmeans_morph.py /data/In /data/Out --hilum-open-fraction 0.12
+  python renalSegment_kmeans_morph.py /data/In /data/Out --no-hilum-open
 """
 from __future__ import print_function
 
@@ -12,7 +13,6 @@ import os
 import sys
 import argparse
 
-# ensure repo root on path when run as script
 ROOT = os.path.dirname(os.path.realpath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -21,18 +21,24 @@ from Source.pipeline_kmeans_morph import run_kmeans_morph_pipeline
 
 
 def main():
-    p = argparse.ArgumentParser(description='Renal segmentation (K-means + morphology)')
+    p = argparse.ArgumentParser(
+        description='Renal segmentation (K-means + morphology)')
     p.add_argument('input_dir', help='Folder with DICOM series')
-    p.add_argument('output_dir', help='Folder for label DICOMs / npy')
+    p.add_argument('output_dir', help='Folder for outputs')
     p.add_argument('--threshold-multiplier', type=float, default=1.0)
-    p.add_argument('--gap-factor', type=float, default=2.5,
-                    help='Trailing trigger gap vs median to drop last phases')
-    p.add_argument('--moco', action='store_true', help='Enable motion correction')
-    p.add_argument('--moco-ref-time', type=float, default=10.0,
-                    help='MoCo reference time in seconds')
+    p.add_argument('--gap-factor', type=float, default=2.5)
+    p.add_argument('--moco', action='store_true')
+    p.add_argument('--moco-ref-time', type=float, default=10.0)
     p.add_argument('--moco-maxiter', type=int, default=40)
-    p.add_argument('--second-grabcut', action='store_true',
-                    help='Re-run GrabCut after MoCo')
+    p.add_argument('--second-grabcut', action='store_true')
+    p.add_argument('--hilum-open-fraction', type=float, default=0.10,
+                    help='Opening radius as fraction of kidney minor-axis width')
+    p.add_argument('--hilum-open-rmin', type=float, default=1.5,
+                    help='Min opening radius (mm)')
+    p.add_argument('--hilum-open-rmax', type=float, default=5.0,
+                    help='Max opening radius (mm)')
+    p.add_argument('--no-hilum-open', action='store_true',
+                    help='Disable axial hilum/vessel stem cleanup')
     args = p.parse_args()
 
     run_kmeans_morph_pipeline(
@@ -45,6 +51,10 @@ def main():
         moco_ref_time_s=args.moco_ref_time,
         moco_maxiter=args.moco_maxiter,
         run_second_grabcut=args.second_grabcut,
+        hilum_open=not args.no_hilum_open,
+        hilum_open_fraction=args.hilum_open_fraction,
+        hilum_open_rmin_mm=args.hilum_open_rmin,
+        hilum_open_rmax_mm=args.hilum_open_rmax,
     )
 
 
