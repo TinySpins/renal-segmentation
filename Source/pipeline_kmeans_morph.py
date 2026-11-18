@@ -315,41 +315,48 @@ def kidney_minor_axis_mm(mask3d, spacing):
     return float(np.median(widths))
 
 
-def opening_radius_vox(minor_mm, spacing, fraction=0.10, rmin_mm=1.5, rmax_mm=5.0):
+def opening_radius_vox(minor_mm, spacing, fraction=0.5):
+    """
+    Opening radius from fraction of minor-axis width only (no min/max clamp).
+    Returns (r_vox, r_mm).
+    """
     sx, sy = float(spacing[0]), float(spacing[1])
     pix = 0.5 * (sx + sy)
-    r_mm = float(np.clip(fraction * minor_mm, rmin_mm, rmax_mm))
+    r_mm = float(fraction * minor_mm)
     r_vox = max(1, int(round(r_mm / max(pix, 1e-6))))
     return r_vox, r_mm
 
 
 def clean_hilum_protrusions_axial(
         gc_labels, spacing,
-        fraction=0.10, rmin_mm=1.5, rmax_mm=5.0,
+        fraction=0.5,
         enabled=True):
     """
-    Axial (per-slice) morphological opening to remove thin vessel/ureter
-    stems at the hilum. Radius = fraction of kidney minor-axis width (mm),
-    clipped to [rmin_mm, rmax_mm].
+    Axial (per-slice) morphological opening to remove thin vessel/ureter stems.
+    Radius = fraction * kidney minor-axis width (mm). No mm min/max clamp.
     """
     if not enabled:
         print('Hilum axial opening: disabled')
         return gc_labels
+
+    print('Hilum axial opening: fraction=%.3f' % fraction)
 
     out = np.zeros_like(gc_labels)
     for kid_id in [k for k in np.unique(gc_labels) if k > 0]:
         m = gc_labels == kid_id
         minor = kidney_minor_axis_mm(m, spacing)
         if minor is None:
-            r_vox, r_mm = 2, 3.0
-            print('Kidney %d: minor axis unknown → open r=%.1f mm (%d vox)' % (
-                kid_id, r_mm, r_vox))
+            sx, sy = float(spacing[0]), float(spacing[1])
+            pix = 0.5 * (sx + sy)
+            r_mm = 3.0
+            r_vox = max(1, int(round(r_mm / max(pix, 1e-6))))
+            print('Kidney %d: minor axis unknown → fallback r=%.2f mm (%d vox); '
+                  'fraction=%.3f (not applied to minor)' % (
+                      kid_id, r_mm, r_vox, fraction))
         else:
-            r_vox, r_mm = opening_radius_vox(
-                minor, spacing, fraction=fraction,
-                rmin_mm=rmin_mm, rmax_mm=rmax_mm)
-            print('Kidney %d: minor≈%.1f mm → open r=%.1f mm (%d vox)' % (
-                kid_id, minor, r_mm, r_vox))
+            r_vox, r_mm = opening_radius_vox(minor, spacing, fraction=fraction)
+            print('Kidney %d: minor≈%.2f mm, fraction=%.3f → open r=%.2f mm (%d vox)' % (
+                kid_id, minor, fraction, r_mm, r_vox))
 
         selem = disk(r_vox)
         cleaned = np.zeros_like(m)
@@ -377,9 +384,7 @@ def run_kmeans_morph_pipeline(
         moco_maxiter=40,
         run_second_grabcut=False,
         hilum_open=True,
-        hilum_open_fraction=0.10,
-        hilum_open_rmin_mm=1.5,
-        hilum_open_rmax_mm=5.0,
+        hilum_open_fraction=0.5,
 ):
     if root_path is None:
         source_path = os.path.dirname(os.path.realpath(__file__))
@@ -418,18 +423,14 @@ def run_kmeans_morph_pipeline(
                 root_path=root_path, threshold_multiplier=threshold_multiplier,
             )
 
-    # ---- axial hilum / vessel stem cleanup ----
     gc_labels = clean_hilum_protrusions_axial(
         gc_labels, spacing,
         fraction=hilum_open_fraction,
-        rmin_mm=hilum_open_rmin_mm,
-        rmax_mm=hilum_open_rmax_mm,
         enabled=hilum_open,
     )
     print('GrabCut labels after hilum cleanup:', np.unique(gc_labels))
     kid_ids = [k for k in np.unique(gc_labels) if k > 0]
 
-    # ---- hole-fill ----
     kidney_raw = gc_labels > 0
     kidney_filled = np.zeros_like(kidney_raw)
     for z in range(kidney_raw.shape[2]):
@@ -441,7 +442,6 @@ def run_kmeans_morph_pipeline(
     kidney = gc_filled > 0
     gc_original = gc_filled > 0
 
-    # ---- PCA + K-means ----
     print('PCA + K-means...')
     recon_diff = recon - np.amin(recon, axis=3, keepdims=True)
     sig = recon_diff.reshape(-1, recon.shape[-1]).astype(np.float32)

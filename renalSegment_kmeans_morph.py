@@ -31,12 +31,8 @@ def main():
     p.add_argument('--moco-ref-time', type=float, default=10.0)
     p.add_argument('--moco-maxiter', type=int, default=40)
     p.add_argument('--second-grabcut', action='store_true')
-    p.add_argument('--hilum-open-fraction', type=float, default=0.10,
-                    help='Opening radius as fraction of kidney minor-axis width')
-    p.add_argument('--hilum-open-rmin', type=float, default=1.5,
-                    help='Min opening radius (mm)')
-    p.add_argument('--hilum-open-rmax', type=float, default=5.0,
-                    help='Max opening radius (mm)')
+    p.add_argument('--hilum-open-fraction', type=float, default=0.5,
+                    help='Opening radius = fraction * kidney minor-axis width (mm)')
     p.add_argument('--no-hilum-open', action='store_true',
                     help='Disable axial hilum/vessel stem cleanup')
     args = p.parse_args()
@@ -53,8 +49,6 @@ def main():
         run_second_grabcut=args.second_grabcut,
         hilum_open=not args.no_hilum_open,
         hilum_open_fraction=args.hilum_open_fraction,
-        hilum_open_rmin_mm=args.hilum_open_rmin,
-        hilum_open_rmax_mm=args.hilum_open_rmax,
     )
 
 
