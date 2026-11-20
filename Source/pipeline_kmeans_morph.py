@@ -7,7 +7,11 @@ Outputs under output_dir:
   nifti/    image.nii, labels.nii, whole_kidney.nii
   dicom/    images/, whole_kidney/, labels/
 
-Hilum/vessel cleanup is OFF unless hilum_open_fraction is set (> 0).
+Hilum cleanup (optional):
+  Hole-filled GrabCut is the reference VOI.
+  Axial opening only *identifies* a removal volume; that volume is subtracted
+  from the hole-filled GrabCut (not replaced by the opened mask).
+  Enabled only when hilum_open_fraction is set (> 0).
 """
 from __future__ import print_function
 
@@ -291,12 +295,28 @@ def export_all_outputs(recon, final_labels, whole_kidney, dicom_list, spacing,
 
 
 # =============================================================================
-# Hilum / vessel stem cleanup
-# Full axial opening, then only drop removed CCs that touch mid SI band
+# Hole-fill GrabCut labels
+# =============================================================================
+
+def hole_fill_grabcut(gc_labels):
+    """Fill holes per axial slice; propagate kidney IDs into filled regions."""
+    kidney_raw = gc_labels > 0
+    kidney_filled = np.zeros_like(kidney_raw)
+    for z in range(kidney_raw.shape[2]):
+        kidney_filled[:, :, z] = binary_fill_holes(kidney_raw[:, :, z])
+
+    idx = distance_transform_edt(
+        ~kidney_raw, return_distances=False, return_indices=True)
+    gc_filled = gc_labels[idx[0], idx[1], idx[2]]
+    gc_filled[~kidney_filled] = 0
+    return gc_filled
+
+
+# =============================================================================
+# Hilum cleanup: opening only identifies removal; subtract from hole-filled GC
 # =============================================================================
 
 def kidney_minor_axis_mm(mask3d, spacing):
-    """Median in-plane minor-axis width (mm) over non-empty axial slices."""
     sx, sy = float(spacing[0]), float(spacing[1])
     widths = []
     for z in range(mask3d.shape[2]):
@@ -319,7 +339,6 @@ def kidney_minor_axis_mm(mask3d, spacing):
 
 
 def opening_radius_vox(minor_mm, spacing, fraction):
-    """Radius = fraction * minor_axis (mm). No min/max clamp."""
     sx, sy = float(spacing[0]), float(spacing[1])
     pix = 0.5 * (sx + sy)
     r_mm = float(fraction * minor_mm)
@@ -327,37 +346,39 @@ def opening_radius_vox(minor_mm, spacing, fraction):
     return r_vox, r_mm
 
 
-def clean_hilum_protrusions_axial(
-        gc_labels, spacing,
+def subtract_hilum_protrusions(
+        gc_filled, spacing,
         fraction=None,
         si_band=0.40):
     """
-    If fraction is None or <= 0: no-op (hilum cleanup off).
+    Reference VOI = hole-filled GrabCut (gc_filled).
 
-    Otherwise:
-      1) Axial morphological opening on all slices
-      2) removed = original & ~opened
-      3) Drop a removed 3D CC only if it intersects the central SI band
-      4) Restore all other removed CCs (poles / ends)
+    If fraction is None or <= 0: return gc_filled unchanged.
+
+    Else:
+      opened     = axial opening of each kidney (detector only)
+      candidates = G0 & ~opened
+      removal    = 3D CCs of candidates that touch central SI band
+      result     = G0 & ~removal
     """
     if fraction is None or float(fraction) <= 0:
-        print('Hilum axial opening: disabled (pass --hilum-open-fraction to enable)')
-        return gc_labels
+        print('Hilum cleanup: disabled (pass --hilum-open-fraction to enable)')
+        return gc_filled
 
     fraction = float(fraction)
     si_band = float(si_band)
     si_band = min(max(si_band, 0.05), 1.0)
 
-    print('Hilum axial opening: ON  fraction=%.3f  si_band=%.2f' % (
-        fraction, si_band))
+    print('Hilum cleanup: ON  fraction=%.3f  si_band=%.2f' % (fraction, si_band))
+    print('  (opening identifies removal; subtracted from hole-filled GrabCut)')
 
-    out = np.zeros_like(gc_labels)
-    for kid_id in [k for k in np.unique(gc_labels) if k > 0]:
-        original = gc_labels == kid_id
-        if not original.any():
+    out = np.zeros_like(gc_filled)
+    for kid_id in [k for k in np.unique(gc_filled) if k > 0]:
+        G0 = gc_filled == kid_id
+        if not G0.any():
             continue
 
-        minor = kidney_minor_axis_mm(original, spacing)
+        minor = kidney_minor_axis_mm(G0, spacing)
         if minor is None:
             sx, sy = float(spacing[0]), float(spacing[1])
             pix = 0.5 * (sx + sy)
@@ -371,17 +392,17 @@ def clean_hilum_protrusions_axial(
                 kid_id, minor, fraction, r_mm, r_vox))
 
         selem = disk(r_vox)
-        opened = np.zeros_like(original)
-        for z in range(original.shape[2]):
-            sl = original[:, :, z]
+        opened = np.zeros_like(G0)
+        for z in range(G0.shape[2]):
+            sl = G0[:, :, z]
             if sl.any():
                 opened[:, :, z] = binary_opening(sl, selem)
 
-        removed = original & ~opened
+        candidates = G0 & ~opened
 
-        zs = np.where(np.any(original, axis=(0, 1)))[0]
+        zs = np.where(np.any(G0, axis=(0, 1)))[0]
         if zs.size == 0:
-            out[opened] = kid_id
+            out[G0] = kid_id
             continue
         z0, z1 = int(zs.min()), int(zs.max())
         zlen = z1 - z0 + 1
@@ -391,26 +412,27 @@ def clean_hilum_protrusions_axial(
         if z_hi < z_lo:
             z_lo, z_hi = z0, z1
 
-        band = np.zeros_like(original)
+        band = np.zeros_like(G0)
         band[:, :, z_lo:z_hi + 1] = True
         print('Kidney %d: SI z=[%d,%d] band z=[%d,%d] (si_band=%.2f)' % (
             kid_id, z0, z1, z_lo, z_hi, si_band))
 
-        cleaned = opened.copy()
-        if removed.any():
-            labeled, nlab = cc_label(removed)
-            n_drop, n_keep = 0, 0
+        removal = np.zeros_like(G0)
+        if candidates.any():
+            labeled, nlab = cc_label(candidates)
+            n_drop, n_skip = 0, 0
             for i in range(1, nlab + 1):
                 comp = labeled == i
                 if np.any(comp & band):
+                    removal[comp] = True
                     n_drop += 1
                 else:
-                    cleaned[comp] = True
-                    n_keep += 1
-            print('Kidney %d: removed CCs drop=%d restore=%d' % (
-                kid_id, n_drop, n_keep))
+                    n_skip += 1
+            print('Kidney %d: candidate CCs remove=%d keep=%d (vox removed=%d)' % (
+                kid_id, n_drop, n_skip, int(removal.sum())))
 
-        out[cleaned] = kid_id
+        G_final = G0 & ~removal
+        out[G_final] = kid_id
 
     return out
 
@@ -469,24 +491,21 @@ def run_kmeans_morph_pipeline(
                 root_path=root_path, threshold_multiplier=threshold_multiplier,
             )
 
-    gc_labels = clean_hilum_protrusions_axial(
-        gc_labels, spacing,
+    # Hole-fill first → reference whole-kidney VOI
+    gc_filled = hole_fill_grabcut(gc_labels)
+    print('After hole-fill:', np.unique(gc_filled))
+
+    # Optional hilum: subtract identified stems from hole-filled GrabCut
+    gc_filled = subtract_hilum_protrusions(
+        gc_filled, spacing,
         fraction=hilum_open_fraction,
         si_band=hilum_si_band,
     )
-    print('GrabCut labels after hilum step:', np.unique(gc_labels))
-    kid_ids = [k for k in np.unique(gc_labels) if k > 0]
+    print('Whole-kidney labels after hilum step:', np.unique(gc_filled))
 
-    kidney_raw = gc_labels > 0
-    kidney_filled = np.zeros_like(kidney_raw)
-    for z in range(kidney_raw.shape[2]):
-        kidney_filled[:, :, z] = binary_fill_holes(kidney_raw[:, :, z])
-    idx = distance_transform_edt(
-        ~kidney_raw, return_distances=False, return_indices=True)
-    gc_filled = gc_labels[idx[0], idx[1], idx[2]]
-    gc_filled[~kidney_filled] = 0
+    kid_ids = [k for k in np.unique(gc_filled) if k > 0]
     kidney = gc_filled > 0
-    gc_original = gc_filled > 0
+    gc_original = kidney.copy()
 
     print('PCA + K-means...')
     recon_diff = recon - np.amin(recon, axis=3, keepdims=True)
