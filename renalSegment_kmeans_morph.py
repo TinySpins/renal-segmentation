@@ -2,10 +2,7 @@
 """
 K-means + morphology renal segmentation CLI.
 
-Usage:
-  python renalSegment_kmeans_morph.py /data/DicomIn /data/DicomOut
-  python renalSegment_kmeans_morph.py /data/In /data/Out --hilum-open-fraction 0.12
-  python renalSegment_kmeans_morph.py /data/In /data/Out --no-hilum-open
+Hilum/vessel cleanup is OFF unless --hilum-open-fraction is set.
 """
 from __future__ import print_function
 
@@ -31,10 +28,14 @@ def main():
     p.add_argument('--moco-ref-time', type=float, default=10.0)
     p.add_argument('--moco-maxiter', type=int, default=40)
     p.add_argument('--second-grabcut', action='store_true')
-    p.add_argument('--hilum-open-fraction', type=float, default=0.5,
-                    help='Opening radius = fraction * kidney minor-axis width (mm)')
-    p.add_argument('--no-hilum-open', action='store_true',
-                    help='Disable axial hilum/vessel stem cleanup')
+    p.add_argument(
+        '--hilum-open-fraction', type=float, default=None,
+        help='Enable hilum cleanup; opening radius = fraction * minor-axis (mm). '
+             'Omit to disable.')
+    p.add_argument(
+        '--hilum-si-band', type=float, default=0.40,
+        help='Central fraction of kidney SI extent used to gate removals '
+             '(default 0.40). Only used if --hilum-open-fraction is set.')
     args = p.parse_args()
 
     run_kmeans_morph_pipeline(
@@ -47,8 +48,8 @@ def main():
         moco_ref_time_s=args.moco_ref_time,
         moco_maxiter=args.moco_maxiter,
         run_second_grabcut=args.second_grabcut,
-        hilum_open=not args.no_hilum_open,
         hilum_open_fraction=args.hilum_open_fraction,
+        hilum_si_band=args.hilum_si_band,
     )
 
 

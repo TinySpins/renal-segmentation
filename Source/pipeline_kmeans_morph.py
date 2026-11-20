@@ -6,6 +6,8 @@ Outputs under output_dir:
   python/   final_labels.npy, whole_kidney.npy, recon_shape.npy
   nifti/    image.nii, labels.nii, whole_kidney.nii
   dicom/    images/, whole_kidney/, labels/
+
+Hilum/vessel cleanup is OFF unless hilum_open_fraction is set (> 0).
 """
 from __future__ import print_function
 
@@ -289,7 +291,8 @@ def export_all_outputs(recon, final_labels, whole_kidney, dicom_list, spacing,
 
 
 # =============================================================================
-# Hilum / vessel stem cleanup (axial morphological opening)
+# Hilum / vessel stem cleanup
+# Full axial opening, then only drop removed CCs that touch mid SI band
 # =============================================================================
 
 def kidney_minor_axis_mm(mask3d, spacing):
@@ -315,11 +318,8 @@ def kidney_minor_axis_mm(mask3d, spacing):
     return float(np.median(widths))
 
 
-def opening_radius_vox(minor_mm, spacing, fraction=0.5):
-    """
-    Opening radius from fraction of minor-axis width only (no min/max clamp).
-    Returns (r_vox, r_mm).
-    """
+def opening_radius_vox(minor_mm, spacing, fraction):
+    """Radius = fraction * minor_axis (mm). No min/max clamp."""
     sx, sy = float(spacing[0]), float(spacing[1])
     pix = 0.5 * (sx + sy)
     r_mm = float(fraction * minor_mm)
@@ -329,43 +329,89 @@ def opening_radius_vox(minor_mm, spacing, fraction=0.5):
 
 def clean_hilum_protrusions_axial(
         gc_labels, spacing,
-        fraction=0.5,
-        enabled=True):
+        fraction=None,
+        si_band=0.40):
     """
-    Axial (per-slice) morphological opening to remove thin vessel/ureter stems.
-    Radius = fraction * kidney minor-axis width (mm). No mm min/max clamp.
+    If fraction is None or <= 0: no-op (hilum cleanup off).
+
+    Otherwise:
+      1) Axial morphological opening on all slices
+      2) removed = original & ~opened
+      3) Drop a removed 3D CC only if it intersects the central SI band
+      4) Restore all other removed CCs (poles / ends)
     """
-    if not enabled:
-        print('Hilum axial opening: disabled')
+    if fraction is None or float(fraction) <= 0:
+        print('Hilum axial opening: disabled (pass --hilum-open-fraction to enable)')
         return gc_labels
 
-    print('Hilum axial opening: fraction=%.3f' % fraction)
+    fraction = float(fraction)
+    si_band = float(si_band)
+    si_band = min(max(si_band, 0.05), 1.0)
+
+    print('Hilum axial opening: ON  fraction=%.3f  si_band=%.2f' % (
+        fraction, si_band))
 
     out = np.zeros_like(gc_labels)
     for kid_id in [k for k in np.unique(gc_labels) if k > 0]:
-        m = gc_labels == kid_id
-        minor = kidney_minor_axis_mm(m, spacing)
+        original = gc_labels == kid_id
+        if not original.any():
+            continue
+
+        minor = kidney_minor_axis_mm(original, spacing)
         if minor is None:
             sx, sy = float(spacing[0]), float(spacing[1])
             pix = 0.5 * (sx + sy)
             r_mm = 3.0
             r_vox = max(1, int(round(r_mm / max(pix, 1e-6))))
-            print('Kidney %d: minor axis unknown → fallback r=%.2f mm (%d vox); '
-                  'fraction=%.3f (not applied to minor)' % (
-                      kid_id, r_mm, r_vox, fraction))
+            print('Kidney %d: minor axis unknown → fallback r=%.2f mm (%d vox)' % (
+                kid_id, r_mm, r_vox))
         else:
-            r_vox, r_mm = opening_radius_vox(minor, spacing, fraction=fraction)
+            r_vox, r_mm = opening_radius_vox(minor, spacing, fraction)
             print('Kidney %d: minor≈%.2f mm, fraction=%.3f → open r=%.2f mm (%d vox)' % (
                 kid_id, minor, fraction, r_mm, r_vox))
 
         selem = disk(r_vox)
-        cleaned = np.zeros_like(m)
-        for z in range(m.shape[2]):
-            sl = m[:, :, z]
-            if not sl.any():
-                continue
-            cleaned[:, :, z] = binary_opening(sl, selem)
+        opened = np.zeros_like(original)
+        for z in range(original.shape[2]):
+            sl = original[:, :, z]
+            if sl.any():
+                opened[:, :, z] = binary_opening(sl, selem)
+
+        removed = original & ~opened
+
+        zs = np.where(np.any(original, axis=(0, 1)))[0]
+        if zs.size == 0:
+            out[opened] = kid_id
+            continue
+        z0, z1 = int(zs.min()), int(zs.max())
+        zlen = z1 - z0 + 1
+        margin = 0.5 * (1.0 - si_band) * zlen
+        z_lo = int(np.floor(z0 + margin))
+        z_hi = int(np.ceil(z1 - margin))
+        if z_hi < z_lo:
+            z_lo, z_hi = z0, z1
+
+        band = np.zeros_like(original)
+        band[:, :, z_lo:z_hi + 1] = True
+        print('Kidney %d: SI z=[%d,%d] band z=[%d,%d] (si_band=%.2f)' % (
+            kid_id, z0, z1, z_lo, z_hi, si_band))
+
+        cleaned = opened.copy()
+        if removed.any():
+            labeled, nlab = cc_label(removed)
+            n_drop, n_keep = 0, 0
+            for i in range(1, nlab + 1):
+                comp = labeled == i
+                if np.any(comp & band):
+                    n_drop += 1
+                else:
+                    cleaned[comp] = True
+                    n_keep += 1
+            print('Kidney %d: removed CCs drop=%d restore=%d' % (
+                kid_id, n_drop, n_keep))
+
         out[cleaned] = kid_id
+
     return out
 
 
@@ -383,8 +429,8 @@ def run_kmeans_morph_pipeline(
         moco_ref_time_s=10.0,
         moco_maxiter=40,
         run_second_grabcut=False,
-        hilum_open=True,
-        hilum_open_fraction=0.5,
+        hilum_open_fraction=None,
+        hilum_si_band=0.40,
 ):
     if root_path is None:
         source_path = os.path.dirname(os.path.realpath(__file__))
@@ -426,9 +472,9 @@ def run_kmeans_morph_pipeline(
     gc_labels = clean_hilum_protrusions_axial(
         gc_labels, spacing,
         fraction=hilum_open_fraction,
-        enabled=hilum_open,
+        si_band=hilum_si_band,
     )
-    print('GrabCut labels after hilum cleanup:', np.unique(gc_labels))
+    print('GrabCut labels after hilum step:', np.unique(gc_labels))
     kid_ids = [k for k in np.unique(gc_labels) if k > 0]
 
     kidney_raw = gc_labels > 0
