@@ -4,18 +4,10 @@ Download the original docker image: https://hub.docker.com/r/umityoruk/renal-seg
 
 Clone the modified repository.
 
-Run the original docker image with the modified Source:
+Run the original docker image with the modified Source.
+The best way to do this is to use one of the included Run Scripts (run conditions can be modified in the beginning of the files):
 
-DATA=/path/to/data
-SRC=/path/to/renal-custom
-
-docker run --rm \
-  -v "$DATA:/data" \
-  -v "$SRC/Source:/renal-segmentation/Source" \
-  -v "$SRC/renalSegment_kmeans_morph.py:/renal-segmentation/renalSegment_kmeans_morph.py" \
-  umityoruk/renal-segmentation \
-  python /renal-segmentation/renalSegment_kmeans_morph.py \
-    /data/DicomIn /data/DicomOut_kmeans_morph
+- batch_kmeans_morph.ps1 (for running the docker in batch mode using Powershell on Windows)
 
 ## Original repo description: renal-segmentation
 
