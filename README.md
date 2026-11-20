@@ -1,4 +1,6 @@
-## Run with modified source: renal-segmentation with K-means clustering and morphological rules
+## Run with modified source
+
+Automatic Renal Segmentation for MR Urography Using 3D-GrabCut with K-means clustering and morphological rules.
 
 Download the original docker image: https://hub.docker.com/r/umityoruk/renal-segmentation/
 
@@ -10,9 +12,9 @@ The best way to do this is to use one of the included Run Scripts (run condition
 - batch_kmeans_morph.ps1 (for running the docker in batch mode using Powershell on Windows)
 
 
-## Run with original source: renal-segmentation
+## Run with original source
 
-Automatic Renal Segmentation for MR Urography Using 3D-GrabCut and Random Forests
+Automatic Renal Segmentation for MR Urography Using 3D-GrabCut and Random Forests.
 
 This is the implementation of the algorithm described in the following paper:
 
