@@ -102,7 +102,7 @@ def _page_coronal_grid(fig, recon, ap_list, time_index, overlay_dict,
                         lab, cmap=style[3], alpha=style[4],
                         vmin=style[1], vmax=style[2],
                         interpolation='none', aspect='equal')
-        ax.set_title('AP=%d' % ap, fontsize=6, pad=1)
+        ax.set_title('AP=%d' % ap, fontsize=6)
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
@@ -272,7 +272,7 @@ def write_qa_pdf(
             ], axis=-1)
             rgb = np.clip(rgb, 0, 1)
             ax.imshow(rgb, interpolation='none', aspect='equal')
-            ax.set_title('AP=%d' % ap, fontsize=6, pad=1)
+            ax.set_title('AP=%d' % ap, fontsize=6)
             ax.set_xticks([])
             ax.set_yticks([])
             for spine in ax.spines.values():
