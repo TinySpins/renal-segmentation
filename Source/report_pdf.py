@@ -55,33 +55,27 @@ def _jet_label_color(val):
 
 
 def _page_coronal_grid(fig, recon, ap_list, time_index, overlay_dict,
-                       title, legend_items=None):
-    """
-    Fill page with coronal thumbnails (left→right, then down).
-    overlay_dict: name -> (mask3d, style)
-      style ('bool', cmap, alpha) or ('labels', vmin, vmax, cmap, alpha)
-    """
+                       title, legend_items=None, max_cols=4):
     n = len(ap_list)
-    nrows, ncols = _grid_shape(n, max_cols=8)
+    nrows, ncols = _grid_shape(n, max_cols=max_cols)
     fig.set_size_inches(11.69, 8.27)
 
-    bottom = 0.10 if legend_items else 0.03
-    fig.subplots_adjust(
-        left=0.02, right=0.98,
-        top=0.93, bottom=bottom,
-        wspace=0.04, hspace=0.12,
-    )
-
-    axes = []
-    for i in range(nrows * ncols):
-        ax = fig.add_subplot(nrows, ncols, i + 1)
-        axes.append(ax)
-    axes = np.array(axes).reshape(nrows, ncols)
+    has_leg = bool(legend_items)
+    # Image area; leave room under for legend axes
+    if has_leg:
+        fig.subplots_adjust(
+            left=0.03, right=0.97, top=0.92, bottom=0.14,
+            wspace=0.06, hspace=0.08,
+        )
+    else:
+        fig.subplots_adjust(
+            left=0.03, right=0.97, top=0.92, bottom=0.03,
+            wspace=0.06, hspace=0.08,
+        )
 
     bg = recon[:, :, :, time_index]
     for i, ap in enumerate(ap_list):
-        r, c = divmod(i, ncols)
-        ax = axes[r, c]
+        ax = fig.add_subplot(nrows, ncols, i + 1)
         img = _coronal_slab(bg, ap)
         ax.imshow(img, cmap='gray', interpolation='none', aspect='equal')
         if overlay_dict:
@@ -102,29 +96,31 @@ def _page_coronal_grid(fig, recon, ap_list, time_index, overlay_dict,
                         lab, cmap=style[3], alpha=style[4],
                         vmin=style[1], vmax=style[2],
                         interpolation='none', aspect='equal')
-        ax.set_title('AP=%d' % ap, fontsize=6)
+        ax.set_title('AP=%d' % ap, fontsize=7)
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(False)
 
     for j in range(n, nrows * ncols):
-        r, c = divmod(j, ncols)
-        axes[r, c].axis('off')
+        ax = fig.add_subplot(nrows, ncols, j + 1)
+        ax.axis('off')
 
     fig.suptitle(title, fontsize=12, y=0.98)
 
-    if legend_items:
-        fig.legend(
-            handles=legend_items,
-            loc='lower center',
-            bbox_to_anchor=(0.5, 0.01),
+    if has_leg:
+        # Dedicated axes — reliable on Matplotlib 2.x / PDF
+        ax_leg = fig.add_axes([0.05, 0.02, 0.90, 0.10])
+        ax_leg.axis('off')
+        ax_leg.legend(
+            handles=list(legend_items),
+            labels=[h.get_label() for h in legend_items],
+            loc='center',
             ncol=min(6, len(legend_items)),
-            fontsize=8,
+            fontsize=9,
             frameon=True,
             fancybox=True,
             framealpha=0.95,
-            edgecolor='0.5',
         )
 
 
@@ -182,15 +178,18 @@ def write_qa_pdf(
         ax = fig.add_subplot(1, 1, 1)
         t = np.arange(nt) * float(temp_res)
         colors = {'cortex': 'C0', 'medulla': 'C1', 'pelvis': 'C2'}
+        n_plotted = 0
         if curves_by_tissue:
             for name, y in curves_by_tissue.items():
                 if y is None:
                     continue
                 ax.plot(t, y, label=name, color=colors.get(name), lw=2)
+                n_plotted += 1
         ax.set_xlabel('Time (s)')
         ax.set_ylabel('Mean signal')
         ax.set_title('Mean signal intensity per tissue')
-        ax.legend(loc='best', fontsize=10)
+        if n_plotted > 0:
+            ax.legend(loc='upper right', fontsize=10, frameon=True)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         pdf.savefig(fig)
