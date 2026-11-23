@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""
-K-means + morphology renal segmentation CLI.
-
-Hilum/vessel cleanup is OFF unless --hilum-open-fraction is set.
-"""
+"""K-means + morphology renal segmentation CLI."""
 from __future__ import print_function
 
 import os
@@ -30,12 +26,10 @@ def main():
     p.add_argument('--second-grabcut', action='store_true')
     p.add_argument(
         '--hilum-open-fraction', type=float, default=None,
-        help='Enable hilum cleanup; opening radius = fraction * minor-axis (mm). '
-             'Omit to disable.')
+        help='Enable hilum cleanup; radius = fraction * minor-axis (mm). Omit=off.')
     p.add_argument(
         '--hilum-si-band', type=float, default=0.40,
-        help='Central fraction of kidney SI extent used to gate removals '
-             '(default 0.40). Only used if --hilum-open-fraction is set.')
+        help='Central SI fraction gating hilum removals (default 0.40).')
     args = p.parse_args()
 
     run_kmeans_morph_pipeline(
